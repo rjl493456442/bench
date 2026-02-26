@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 // openDirect opens the named file for reading with O_DIRECT, which instructs
@@ -43,18 +45,40 @@ func freeBuffer(buf []byte) {
 	_ = syscall.Munmap(buf)
 }
 
-// dropPageCache writes "3" to /proc/sys/vm/drop_caches to evict all page cache,
-// dentry, and inode caches. This requires root privileges.
-func dropPageCache() error {
-	// Flush dirty pages to disk before dropping.
-	syscall.Sync()
-
-	f, err := os.OpenFile("/proc/sys/vm/drop_caches", os.O_WRONLY, 0)
+// dropPageCache evicts the cached pages for the named file from the kernel
+// page cache using posix_fadvise(POSIX_FADV_DONTNEED).
+//
+// Unlike madvise(MADV_DONTNEED) on a MAP_SHARED mapping — which only removes
+// the pages from the calling process's page table without touching the kernel
+// page cache — posix_fadvise(FADV_DONTNEED) calls invalidate_mapping_pages()
+// inside the kernel, which directly walks the file's page cache and releases
+// its clean pages synchronously. Since the benchmark dataset is never written
+// during a run, all pages are clean and the drop is immediate.
+//
+// No elevated privileges are required.
+//
+// Fallback: write "3" to /proc/sys/vm/drop_caches (requires CAP_SYS_ADMIN).
+func dropPageCache(path string) error {
+	f, err := os.Open(path)
 	if err != nil {
-		return fmt.Errorf("drop_caches (run as root?): %w", err)
+		return err
 	}
 	defer f.Close()
-	_, err = f.WriteString("3\n")
+
+	// posix_fadvise(POSIX_FADV_DONTNEED) – no root required.
+	// unix.Fadvise is available for all Linux architectures via golang.org/x/sys.
+	if err := unix.Fadvise(int(f.Fd()), 0, 0, unix.FADV_DONTNEED); err == nil {
+		return nil
+	}
+
+	// Fallback: global cache drop (requires root / CAP_SYS_ADMIN).
+	syscall.Sync()
+	df, err := os.OpenFile("/proc/sys/vm/drop_caches", os.O_WRONLY, 0)
+	if err != nil {
+		return fmt.Errorf("fadvise unavailable and drop_caches requires root: %w", err)
+	}
+	defer df.Close()
+	_, err = df.WriteString("3\n")
 	return err
 }
 

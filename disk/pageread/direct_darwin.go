@@ -51,7 +51,9 @@ func freeBuffer(buf []byte) {
 // dropPageCache attempts to flush the macOS unified buffer cache via `purge`.
 // The `purge` binary is installed by default on macOS but may require
 // administrator privileges on some versions.
-func dropPageCache() error {
+// The path argument is accepted for API consistency with the Linux implementation
+// but is unused — F_NOCACHE on the read fd already bypasses caching.
+func dropPageCache(_ string) error {
 	return exec.Command("purge").Run()
 }
 

@@ -192,7 +192,7 @@ func benchmark(path string, pageSize, passes int) (*result, error) {
 		log.Printf("  [%s] pass %d/%d – clearing page cache...",
 			fmtSize(pageSize), pass, passes)
 
-		if err := dropPageCache(); err != nil {
+		if err := dropPageCache(path); err != nil {
 			log.Printf("    Warning: could not drop page cache: %v", err)
 			log.Printf("    Continuing; direct I/O will still bypass the cache.")
 		}
