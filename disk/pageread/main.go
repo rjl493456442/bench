@@ -15,7 +15,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -51,14 +53,21 @@ func (m readMode) String() string {
 
 // ── Result type ───────────────────────────────────────────────────────────────
 
-// result holds raw measurements for one (pageSize, mode) benchmark run.
+// result holds raw measurements for one (pageSize, mode, queueDepth) benchmark run.
 type result struct {
-	mode      readMode
-	pageSize  int
-	reads     int64
-	bytes     int64
-	duration  time.Duration
-	latencies []time.Duration // per-read latencies, sorted ascending after run
+	mode       readMode
+	pageSize   int
+	queueDepth int           // 1 = legacy single-read path
+	reads      int64
+	bytes      int64
+	duration   time.Duration
+	latencies  []time.Duration // per-read latencies, sorted ascending after run
+}
+
+// benchKey groups results by access pattern and queue depth.
+type benchKey struct {
+	mode readMode
+	qd   int
 }
 
 func (r *result) throughputMBps() float64 {
@@ -182,10 +191,14 @@ func randomOffsets(fileSize, pageSize int64) []int64 {
 }
 
 // runPass performs one full pass over the data file using buffers of pageSize
-// bytes. In sequential mode it reads from start to finish; in random mode it
-// issues the same number of reads at uniformly random aligned offsets.
+// bytes. When queueDepth is 1, it uses the single-read code path; when >1 it
+// delegates to runPassConcurrent to exploit NCQ / NVMe command queuing.
 // The returned result has its latency slice sorted ascending.
-func runPass(path string, pageSize int, mode readMode) (*result, error) {
+func runPass(path string, pageSize int, mode readMode, queueDepth int) (*result, error) {
+	if queueDepth > 1 {
+		return runPassConcurrent(path, pageSize, mode, queueDepth)
+	}
+
 	// Stat the file first to know the size for random offset generation.
 	// This is done before opening the direct-I/O fd so the stat syscall is
 	// excluded from the measured duration.
@@ -210,7 +223,7 @@ func runPass(path string, pageSize int, mode readMode) (*result, error) {
 	buf := newBuffer(pageSize)
 	defer freeBuffer(buf)
 
-	r := &result{mode: mode, pageSize: pageSize}
+	r := &result{mode: mode, pageSize: pageSize, queueDepth: 1}
 
 	start := time.Now()
 
@@ -261,26 +274,131 @@ func runPass(path string, pageSize int, mode readMode) (*result, error) {
 	return r, nil
 }
 
-// benchmark runs one or more passes for a (pageSize, mode) pair and aggregates
-// all passes into a single result.
-func benchmark(path string, pageSize int, mode readMode, passes int) (*result, error) {
-	combined := &result{mode: mode, pageSize: pageSize}
+// runPassConcurrent performs one pass with multiple goroutines issuing reads
+// concurrently, keeping the device's command queue (NCQ/NVMe) busy.
+// All modes use ReadAt since concurrent goroutines cannot share a file position.
+func runPassConcurrent(path string, pageSize int, mode readMode, queueDepth int) (*result, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	fileSize := info.Size()
+	nReads := int(fileSize / int64(pageSize))
+
+	// Generate offsets: sequential or shuffled.
+	offsets := make([]int64, nReads)
+	for i := range offsets {
+		offsets[i] = int64(i) * int64(pageSize)
+	}
+	if mode == modeRand {
+		rand.Shuffle(len(offsets), func(i, j int) {
+			offsets[i], offsets[j] = offsets[j], offsets[i]
+		})
+	}
+
+	f, err := openDirect(path)
+	if err != nil {
+		return nil, fmt.Errorf("openDirect: %w", err)
+	}
+	defer f.Close()
+
+	// Allocate one aligned buffer per worker.
+	bufs := make([][]byte, queueDepth)
+	for i := range bufs {
+		bufs[i] = newBuffer(pageSize)
+	}
+	defer func() {
+		for _, b := range bufs {
+			freeBuffer(b)
+		}
+	}()
+
+	// Pre-allocate per-read slices; each slot written by exactly one goroutine.
+	latencies := make([]time.Duration, nReads)
+	byteCounts := make([]int64, nReads)
+
+	type workItem struct {
+		index  int
+		offset int64
+	}
+	work := make(chan workItem)
+
+	var wg sync.WaitGroup
+	var readErr error
+	var errOnce sync.Once
+
+	// Launch worker pool.
+	for w := 0; w < queueDepth; w++ {
+		wg.Add(1)
+		go func(buf []byte) {
+			defer wg.Done()
+			for item := range work {
+				t0 := time.Now()
+				n, err := f.ReadAt(buf, item.offset)
+				latencies[item.index] = time.Since(t0)
+				byteCounts[item.index] = int64(n)
+				if err != nil && err != io.EOF {
+					errOnce.Do(func() { readErr = fmt.Errorf("readAt offset %d: %w", item.offset, err) })
+					return
+				}
+			}
+		}(bufs[w])
+	}
+
+	// Feed work items; timing starts here.
+	start := time.Now()
+	for i, off := range offsets {
+		work <- workItem{index: i, offset: off}
+	}
+	close(work)
+	wg.Wait()
+	duration := time.Since(start)
+
+	if readErr != nil {
+		return nil, readErr
+	}
+
+	// Aggregate results.
+	r := &result{
+		mode:       mode,
+		pageSize:   pageSize,
+		queueDepth: queueDepth,
+		duration:   duration,
+		latencies:  make([]time.Duration, 0, nReads),
+	}
+	for i := 0; i < nReads; i++ {
+		if byteCounts[i] > 0 {
+			r.reads++
+			r.bytes += byteCounts[i]
+			r.latencies = append(r.latencies, latencies[i])
+		}
+	}
+	sort.Slice(r.latencies, func(i, j int) bool {
+		return r.latencies[i] < r.latencies[j]
+	})
+	return r, nil
+}
+
+// benchmark runs one or more passes for a (pageSize, mode, queueDepth) tuple
+// and aggregates all passes into a single result.
+func benchmark(path string, pageSize int, mode readMode, passes int, queueDepth int) (*result, error) {
+	combined := &result{mode: mode, pageSize: pageSize, queueDepth: queueDepth}
 
 	for pass := 1; pass <= passes; pass++ {
-		log.Printf("  [%s/%s] pass %d/%d – clearing page cache...",
-			fmtSize(pageSize), mode, pass, passes)
+		log.Printf("  [%s/%s/QD%d] pass %d/%d – clearing page cache...",
+			fmtSize(pageSize), mode, queueDepth, pass, passes)
 
 		if err := dropPageCache(path); err != nil {
 			log.Printf("    Warning: could not drop page cache: %v", err)
 			log.Printf("    Continuing; direct I/O will still bypass the cache.")
 		}
 
-		r, err := runPass(path, pageSize, mode)
+		r, err := runPass(path, pageSize, mode, queueDepth)
 		if err != nil {
 			return nil, err
 		}
-		log.Printf("  [%s/%s] pass %d/%d – %.2f MB/s, %.0f IOPS, avg %s",
-			fmtSize(pageSize), mode, pass, passes,
+		log.Printf("  [%s/%s/QD%d] pass %d/%d – %.2f MB/s, %.0f IOPS, avg %s",
+			fmtSize(pageSize), mode, queueDepth, pass, passes,
 			r.throughputMBps(), r.iops(), fmtDuration(r.avg()))
 
 		combined.reads += r.reads
@@ -377,7 +495,7 @@ func writeObservations(p func(string, ...any), results []*result) {
 		fmtSize(last.pageSize), ratio, trend, fmtSize(first.pageSize))
 }
 
-func exportMarkdown(outPath, dataFile string, fileSize int64, passes int, allResults map[readMode][]*result, storage *StorageInfo) error {
+func exportMarkdown(outPath, dataFile string, fileSize int64, passes int, allResults map[benchKey][]*result, queueDepths []int, storage *StorageInfo) error {
 	f, err := os.Create(outPath)
 	if err != nil {
 		return fmt.Errorf("create output: %w", err)
@@ -386,6 +504,13 @@ func exportMarkdown(outPath, dataFile string, fileSize int64, passes int, allRes
 
 	p := func(format string, args ...any) {
 		fmt.Fprintf(f, format+"\n", args...)
+	}
+
+	multiQD := len(queueDepths) > 1
+
+	qdStrs := make([]string, len(queueDepths))
+	for i, qd := range queueDepths {
+		qdStrs[i] = strconv.Itoa(qd)
 	}
 
 	p("# Disk Read Performance Benchmark")
@@ -399,6 +524,7 @@ func exportMarkdown(outPath, dataFile string, fileSize int64, passes int, allRes
 	p("| Architecture | %s |", runtime.GOARCH)
 	p("| Data File | `%s` |", dataFile)
 	p("| File Size | %.0f MB |", float64(fileSize)/(1024*1024))
+	p("| Queue Depths | %s |", strings.Join(qdStrs, ", "))
 	p("| Passes per Page Size | %d |", passes)
 	p("| Cache Bypass Method | `%s` |", directIOMethod())
 	if storage != nil {
@@ -412,21 +538,28 @@ func exportMarkdown(outPath, dataFile string, fileSize int64, passes int, allRes
 	p("> Latency values are per individual `read(2)` / `pread(2)` syscall.  ")
 	p("> Throughput and IOPS are averaged across all passes.")
 
-	// Emit one sub-section per mode, in a stable order.
+	// Emit one sub-section per (mode, qd) pair, in a stable order.
 	for _, mode := range []readMode{modeSeq, modeRand} {
-		rs, ok := allResults[mode]
-		if !ok {
-			continue
+		for _, qd := range queueDepths {
+			key := benchKey{mode: mode, qd: qd}
+			rs, ok := allResults[key]
+			if !ok {
+				continue
+			}
+			p("")
+			name := mode.String()
+			title := fmt.Sprintf("%s Read Results", strings.ToUpper(name[:1])+name[1:])
+			if multiQD {
+				title += fmt.Sprintf(" (QD=%d)", qd)
+			}
+			p("## %s", title)
+			p("")
+			writeResultTable(p, rs)
+			p("")
+			p("### Observations")
+			p("")
+			writeObservations(p, rs)
 		}
-		p("")
-		name := mode.String()
-		p("## %s Read Results", strings.ToUpper(name[:1])+name[1:])
-		p("")
-		writeResultTable(p, rs)
-		p("")
-		p("### Observations")
-		p("")
-		writeObservations(p, rs)
 	}
 
 	p("")
@@ -443,6 +576,9 @@ func exportMarkdown(outPath, dataFile string, fileSize int64, passes int, allRes
 	p("   Offsets are pre-generated before the timed loop to exclude RNG overhead.")
 	p("5. **Aggregation**: when multiple passes are requested, latency samples are")
 	p("   pooled and throughput / IOPS are averaged across all passes.")
+	p("6. **Queue depth**: when QD > 1, a pool of QD goroutines issues concurrent")
+	p("   `pread(2)` calls on the same file descriptor, keeping the device's NCQ /")
+	p("   NVMe submission queue busy. QD = 1 uses the legacy single-read path.")
 	p("")
 	p("---")
 	p("")
@@ -461,6 +597,7 @@ func main() {
 		skipInit = flag.Bool("skip-init", false, "skip dataset creation if a correct-size file already exists")
 		passes   = flag.Int("passes", 1, "number of read passes per (page size, mode) pair")
 		modeFlag = flag.String("mode", "both", `access pattern: "seq", "rand", or "both"`)
+		qdFlag   = flag.String("qd", "1", `queue depth(s), comma-separated (e.g. "1,32,64")`)
 	)
 	flag.Parse()
 
@@ -475,6 +612,20 @@ func main() {
 		modes = []readMode{modeSeq, modeRand}
 	default:
 		log.Fatalf("unknown --mode %q: use seq, rand, or both", *modeFlag)
+	}
+
+	// Parse queue depth flag.
+	var queueDepths []int
+	for _, s := range strings.Split(*qdFlag, ",") {
+		s = strings.TrimSpace(s)
+		qd, err := strconv.Atoi(s)
+		if err != nil {
+			log.Fatalf("invalid queue depth %q: %v", s, err)
+		}
+		if qd <= 0 {
+			log.Fatalf("queue depth must be > 0, got %d", qd)
+		}
+		queueDepths = append(queueDepths, qd)
 	}
 
 	// Align file size to 1 MB so every page size divides it evenly.
@@ -495,6 +646,10 @@ func main() {
 	for i, m := range modes {
 		modeNames[i] = m.String()
 	}
+	qdStrs := make([]string, len(queueDepths))
+	for i, qd := range queueDepths {
+		qdStrs[i] = strconv.Itoa(qd)
+	}
 	log.Printf("Starting benchmark")
 	log.Printf("  File   : %s (%.0f MB)", dataPath, float64(fileSize)/(1024*1024))
 	log.Printf("  Sizes  : %s", strings.Join(func() []string {
@@ -505,23 +660,27 @@ func main() {
 		return ss
 	}(), ", "))
 	log.Printf("  Mode   : %s", strings.Join(modeNames, ", "))
+	log.Printf("  QD     : %s", strings.Join(qdStrs, ", "))
 	log.Printf("  Passes : %d", *passes)
 	log.Printf("  Method : %s + %s (cache drop)", directIOMethod(), pageCacheDropMethod())
 
-	allResults := make(map[readMode][]*result)
+	allResults := make(map[benchKey][]*result)
 
 	for _, mode := range modes {
-		log.Printf("=== %s read ===", strings.ToUpper(mode.String()))
-		for _, ps := range pageSizes {
-			log.Printf("Benchmarking %s pages (%s)...", fmtSize(ps), mode)
-			r, err := benchmark(dataPath, ps, mode, *passes)
-			if err != nil {
-				log.Fatalf("benchmark [%s/%s]: %v", fmtSize(ps), mode, err)
+		for _, qd := range queueDepths {
+			log.Printf("=== %s read (QD=%d) ===", strings.ToUpper(mode.String()), qd)
+			for _, ps := range pageSizes {
+				log.Printf("Benchmarking %s pages (%s, QD=%d)...", fmtSize(ps), mode, qd)
+				r, err := benchmark(dataPath, ps, mode, *passes, qd)
+				if err != nil {
+					log.Fatalf("benchmark [%s/%s/QD%d]: %v", fmtSize(ps), mode, qd, err)
+				}
+				key := benchKey{mode: mode, qd: qd}
+				allResults[key] = append(allResults[key], r)
+				log.Printf("  => %.2f MB/s, %.0f IOPS, avg %s, p99 %s",
+					r.throughputMBps(), r.iops(),
+					fmtDuration(r.avg()), fmtDuration(r.percentile(99)))
 			}
-			allResults[mode] = append(allResults[mode], r)
-			log.Printf("  => %.2f MB/s, %.0f IOPS, avg %s, p99 %s",
-				r.throughputMBps(), r.iops(),
-				fmtDuration(r.avg()), fmtDuration(r.percentile(99)))
 		}
 	}
 
@@ -531,7 +690,7 @@ func main() {
 		storage = nil
 	}
 
-	if err := exportMarkdown(*output, dataPath, fileSize, *passes, allResults, storage); err != nil {
+	if err := exportMarkdown(*output, dataPath, fileSize, *passes, allResults, queueDepths, storage); err != nil {
 		log.Fatalf("export markdown: %v", err)
 	}
 	log.Printf("Results written to: %s", *output)
