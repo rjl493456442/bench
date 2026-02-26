@@ -377,7 +377,7 @@ func writeObservations(p func(string, ...any), results []*result) {
 		fmtSize(last.pageSize), ratio, trend, fmtSize(first.pageSize))
 }
 
-func exportMarkdown(outPath, dataFile string, fileSize int64, passes int, allResults map[readMode][]*result) error {
+func exportMarkdown(outPath, dataFile string, fileSize int64, passes int, allResults map[readMode][]*result, storage *StorageInfo) error {
 	f, err := os.Create(outPath)
 	if err != nil {
 		return fmt.Errorf("create output: %w", err)
@@ -401,6 +401,16 @@ func exportMarkdown(outPath, dataFile string, fileSize int64, passes int, allRes
 	p("| File Size | %.0f MB |", float64(fileSize)/(1024*1024))
 	p("| Passes per Page Size | %d |", passes)
 	p("| Cache Bypass Method | `%s` |", directIOMethod())
+	if storage != nil {
+		p("| Storage Device | %s (`%s`) |", storage.Model, storage.Device)
+		p("| Interface | %s |", storage.Interface())
+		if storage.Serial != "" {
+			p("| Serial | %s |", storage.Serial)
+		}
+		if storage.Firmware != "" {
+			p("| Firmware | %s |", storage.Firmware)
+		}
+	}
 	p("")
 	p("> Latency values are per individual `read(2)` / `pread(2)` syscall.  ")
 	p("> Throughput and IOPS are averaged across all passes.")
@@ -518,7 +528,13 @@ func main() {
 		}
 	}
 
-	if err := exportMarkdown(*output, dataPath, fileSize, *passes, allResults); err != nil {
+	storage, storageErr := detectStorage(dataPath)
+	if storageErr != nil {
+		log.Printf("Warning: storage detection failed: %v", storageErr)
+		storage = nil
+	}
+
+	if err := exportMarkdown(*output, dataPath, fileSize, *passes, allResults, storage); err != nil {
 		log.Fatalf("export markdown: %v", err)
 	}
 	log.Printf("Results written to: %s", *output)
