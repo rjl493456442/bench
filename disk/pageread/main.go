@@ -1,6 +1,6 @@
-// Package main benchmarks sequential disk read performance across different
-// page sizes, bypassing the OS page cache to measure true disk I/O latency
-// and throughput.
+// Package main benchmarks disk read performance across different page sizes
+// and access patterns (sequential and random), bypassing the OS page cache
+// to measure true storage-device latency and throughput.
 package main
 
 import (
@@ -21,21 +21,39 @@ import (
 
 // pageSizes lists the read buffer sizes to benchmark, from 4 KB to 1 MB.
 var pageSizes = []int{
-	4 * 1024,         // 4 KB  – typical filesystem block
-	8 * 1024,         // 8 KB  – PostgreSQL default page size
-	16 * 1024,        // 16 KB
-	32 * 1024,        // 32 KB
-	64 * 1024,        // 64 KB
-	128 * 1024,       // 128 KB
-	256 * 1024,       // 256 KB
-	512 * 1024,       // 512 KB
-	1 * 1024 * 1024,  // 1 MB
+	4 * 1024,        // 4 KB  – typical filesystem block
+	8 * 1024,        // 8 KB  – PostgreSQL default page size
+	16 * 1024,       // 16 KB
+	32 * 1024,       // 32 KB
+	64 * 1024,       // 64 KB
+	128 * 1024,      // 128 KB
+	256 * 1024,      // 256 KB
+	512 * 1024,      // 512 KB
+	1 * 1024 * 1024, // 1 MB
 }
 
 const dataFileName = "bench_pageread.bin"
 
-// result holds raw measurements for one page-size benchmark run.
+// readMode selects the I/O access pattern.
+type readMode uint8
+
+const (
+	modeSeq  readMode = iota // sequential: start-to-finish
+	modeRand                 // random: uniformly random aligned offsets
+)
+
+func (m readMode) String() string {
+	if m == modeSeq {
+		return "sequential"
+	}
+	return "random"
+}
+
+// ── Result type ───────────────────────────────────────────────────────────────
+
+// result holds raw measurements for one (pageSize, mode) benchmark run.
 type result struct {
+	mode      readMode
 	pageSize  int
 	reads     int64
 	bytes     int64
@@ -68,7 +86,7 @@ func (r *result) avg() time.Duration {
 	return time.Duration(total / int64(len(r.latencies)))
 }
 
-// percentile returns the p-th percentile latency (p in [0,100]).
+// percentile returns the p-th percentile latency (p in [0, 100]).
 func (r *result) percentile(p float64) time.Duration {
 	n := len(r.latencies)
 	if n == 0 {
@@ -98,9 +116,11 @@ func (r *result) max() time.Duration {
 	return r.latencies[len(r.latencies)-1]
 }
 
+// ── Dataset ───────────────────────────────────────────────────────────────────
+
 // initDataset creates (or verifies) the benchmark data file.
-// It fills the file with deterministic pseudo-random bytes so that
-// filesystem compression cannot skew results.
+// It fills the file with deterministic pseudo-random bytes so that filesystem
+// compression cannot skew results.
 func initDataset(path string, size int64) error {
 	if info, err := os.Stat(path); err == nil && info.Size() == size {
 		log.Printf("Dataset already exists: %s (%.0f MB) – skipping creation", path, float64(size)/(1024*1024))
@@ -120,7 +140,6 @@ func initDataset(path string, size int64) error {
 
 	var written int64
 	for written < size {
-		// Fill chunk with pseudo-random 64-bit words.
 		for i := 0; i+8 <= len(chunk); i += 8 {
 			binary.LittleEndian.PutUint64(chunk[i:], rng.Uint64())
 		}
@@ -143,10 +162,45 @@ func initDataset(path string, size int64) error {
 	return nil
 }
 
-// runPass performs one full sequential read of the data file using buffers of
-// pageSize bytes, recording per-read latency. The returned result has its
-// latency slice sorted ascending.
-func runPass(path string, pageSize int) (*result, error) {
+// ── Benchmark core ────────────────────────────────────────────────────────────
+
+// randomOffsets returns a uniformly random permutation of every page-aligned
+// block offset in [0, fileSize). Each block appears exactly once, so the
+// benchmark reads the entire file without revisiting any block.
+// Offsets are generated before the timed I/O loop so that shuffle overhead is
+// excluded from the measured latency.
+func randomOffsets(fileSize, pageSize int64) []int64 {
+	nReads := int(fileSize / pageSize)
+	offsets := make([]int64, nReads)
+	for i := range offsets {
+		offsets[i] = int64(i) * pageSize
+	}
+	rand.Shuffle(len(offsets), func(i, j int) {
+		offsets[i], offsets[j] = offsets[j], offsets[i]
+	})
+	return offsets
+}
+
+// runPass performs one full pass over the data file using buffers of pageSize
+// bytes. In sequential mode it reads from start to finish; in random mode it
+// issues the same number of reads at uniformly random aligned offsets.
+// The returned result has its latency slice sorted ascending.
+func runPass(path string, pageSize int, mode readMode) (*result, error) {
+	// Stat the file first to know the size for random offset generation.
+	// This is done before opening the direct-I/O fd so the stat syscall is
+	// excluded from the measured duration.
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	fileSize := info.Size()
+
+	// Pre-generate random offsets before starting the timer.
+	var offsets []int64
+	if mode == modeRand {
+		offsets = randomOffsets(fileSize, int64(pageSize))
+	}
+
 	f, err := openDirect(path)
 	if err != nil {
 		return nil, fmt.Errorf("openDirect: %w", err)
@@ -156,27 +210,50 @@ func runPass(path string, pageSize int) (*result, error) {
 	buf := newBuffer(pageSize)
 	defer freeBuffer(buf)
 
-	r := &result{pageSize: pageSize}
+	r := &result{mode: mode, pageSize: pageSize}
 
-	overallStart := time.Now()
-	for {
-		t0 := time.Now()
-		n, readErr := f.Read(buf)
-		latency := time.Since(t0)
+	start := time.Now()
 
-		if n > 0 {
-			r.reads++
-			r.bytes += int64(n)
-			r.latencies = append(r.latencies, latency)
+	switch mode {
+	case modeSeq:
+		for {
+			t0 := time.Now()
+			n, readErr := f.Read(buf)
+			latency := time.Since(t0)
+
+			if n > 0 {
+				r.reads++
+				r.bytes += int64(n)
+				r.latencies = append(r.latencies, latency)
+			}
+			if readErr == io.EOF {
+				break
+			}
+			if readErr != nil {
+				return nil, fmt.Errorf("read at offset %d: %w", r.bytes, readErr)
+			}
 		}
-		if readErr == io.EOF {
-			break
-		}
-		if readErr != nil {
-			return nil, fmt.Errorf("read (offset %d): %w", r.bytes, readErr)
+
+	case modeRand:
+		for _, off := range offsets {
+			t0 := time.Now()
+			n, readErr := f.ReadAt(buf, off)
+			latency := time.Since(t0)
+
+			if n > 0 {
+				r.reads++
+				r.bytes += int64(n)
+				r.latencies = append(r.latencies, latency)
+			}
+			// ReadAt on a fully-in-range offset should not return EOF, but
+			// treat it as non-fatal to be safe.
+			if readErr != nil && readErr != io.EOF {
+				return nil, fmt.Errorf("readAt offset %d: %w", off, readErr)
+			}
 		}
 	}
-	r.duration = time.Since(overallStart)
+
+	r.duration = time.Since(start)
 
 	sort.Slice(r.latencies, func(i, j int) bool {
 		return r.latencies[i] < r.latencies[j]
@@ -184,25 +261,26 @@ func runPass(path string, pageSize int) (*result, error) {
 	return r, nil
 }
 
-// benchmark runs one or more passes for a given page size, aggregating results.
-func benchmark(path string, pageSize, passes int) (*result, error) {
-	combined := &result{pageSize: pageSize}
+// benchmark runs one or more passes for a (pageSize, mode) pair and aggregates
+// all passes into a single result.
+func benchmark(path string, pageSize int, mode readMode, passes int) (*result, error) {
+	combined := &result{mode: mode, pageSize: pageSize}
 
 	for pass := 1; pass <= passes; pass++ {
-		log.Printf("  [%s] pass %d/%d – clearing page cache...",
-			fmtSize(pageSize), pass, passes)
+		log.Printf("  [%s/%s] pass %d/%d – clearing page cache...",
+			fmtSize(pageSize), mode, pass, passes)
 
 		if err := dropPageCache(path); err != nil {
 			log.Printf("    Warning: could not drop page cache: %v", err)
 			log.Printf("    Continuing; direct I/O will still bypass the cache.")
 		}
 
-		r, err := runPass(path, pageSize)
+		r, err := runPass(path, pageSize, mode)
 		if err != nil {
 			return nil, err
 		}
-		log.Printf("  [%s] pass %d/%d – %.2f MB/s, %.0f IOPS, avg %s",
-			fmtSize(pageSize), pass, passes,
+		log.Printf("  [%s/%s] pass %d/%d – %.2f MB/s, %.0f IOPS, avg %s",
+			fmtSize(pageSize), mode, pass, passes,
 			r.throughputMBps(), r.iops(), fmtDuration(r.avg()))
 
 		combined.reads += r.reads
@@ -211,7 +289,6 @@ func benchmark(path string, pageSize, passes int) (*result, error) {
 		combined.latencies = append(combined.latencies, r.latencies...)
 	}
 
-	// Re-sort the combined latency slice.
 	sort.Slice(combined.latencies, func(i, j int) bool {
 		return combined.latencies[i] < combined.latencies[j]
 	})
@@ -256,7 +333,51 @@ func fmtFloat(f float64) string {
 
 // ── Markdown export ───────────────────────────────────────────────────────────
 
-func exportMarkdown(outPath, dataFile string, fileSize int64, passes int, results []*result) error {
+func writeResultTable(p func(string, ...any), results []*result) {
+	p("| Page Size | Reads | Throughput | IOPS | Avg Lat | P50 | P90 | P99 | P99.9 | Min | Max |")
+	p("|----------:|------:|-----------:|-----:|--------:|----:|----:|----:|------:|----:|----:|")
+	for _, r := range results {
+		p("| %s | %s | %.2f MB/s | %s | %s | %s | %s | %s | %s | %s | %s |",
+			fmtSize(r.pageSize),
+			fmtFloat(float64(r.reads)),
+			r.throughputMBps(),
+			fmtFloat(r.iops()),
+			fmtDuration(r.avg()),
+			fmtDuration(r.percentile(50)),
+			fmtDuration(r.percentile(90)),
+			fmtDuration(r.percentile(99)),
+			fmtDuration(r.percentile(99.9)),
+			fmtDuration(r.min()),
+			fmtDuration(r.max()),
+		)
+	}
+}
+
+func writeObservations(p func(string, ...any), results []*result) {
+	if len(results) == 0 {
+		return
+	}
+	best := results[0]
+	for _, r := range results[1:] {
+		if r.throughputMBps() > best.throughputMBps() {
+			best = r
+		}
+	}
+	p("- Peak throughput **%.2f MB/s** achieved with **%s** page size.",
+		best.throughputMBps(), fmtSize(best.pageSize))
+
+	first, last := results[0], results[len(results)-1]
+	ratio := last.throughputMBps() / first.throughputMBps()
+	trend := "higher"
+	if ratio < 1 {
+		ratio = 1 / ratio
+		trend = "lower"
+	}
+	p("- Throughput with %s pages is **%.1fx %s** than with %s pages.",
+		fmtSize(last.pageSize), ratio, trend, fmtSize(first.pageSize))
+}
+
+func exportMarkdown(outPath, dataFile string, fileSize int64, passes int, allResults map[readMode][]*result) error {
 	f, err := os.Create(outPath)
 	if err != nil {
 		return fmt.Errorf("create output: %w", err)
@@ -281,32 +402,24 @@ func exportMarkdown(outPath, dataFile string, fileSize int64, passes int, result
 	p("| Passes per Page Size | %d |", passes)
 	p("| Cache Bypass Method | `%s` |", directIOMethod())
 	p("")
-	p("## Results")
-	p("")
-	p("> Latency values are per individual `read(2)` syscall.  ")
+	p("> Latency values are per individual `read(2)` / `pread(2)` syscall.  ")
 	p("> Throughput and IOPS are averaged across all passes.")
-	p("")
 
-	// Column widths are fixed; use a separator that matches the header.
-	header := "| Page Size | Reads | Throughput | IOPS | Avg Lat | P50 | P90 | P99 | P99.9 | Min | Max |"
-	sep := "|----------:|------:|-----------:|-----:|--------:|----:|----:|----:|------:|----:|----:|"
-	p(header)
-	p(sep)
-
-	for _, r := range results {
-		p("| %s | %s | %.2f MB/s | %s | %s | %s | %s | %s | %s | %s | %s |",
-			fmtSize(r.pageSize),
-			fmtFloat(float64(r.reads)),
-			r.throughputMBps(),
-			fmtFloat(r.iops()),
-			fmtDuration(r.avg()),
-			fmtDuration(r.percentile(50)),
-			fmtDuration(r.percentile(90)),
-			fmtDuration(r.percentile(99)),
-			fmtDuration(r.percentile(99.9)),
-			fmtDuration(r.min()),
-			fmtDuration(r.max()),
-		)
+	// Emit one sub-section per mode, in a stable order.
+	for _, mode := range []readMode{modeSeq, modeRand} {
+		rs, ok := allResults[mode]
+		if !ok {
+			continue
+		}
+		p("")
+		name := mode.String()
+		p("## %s Read Results", strings.ToUpper(name[:1])+name[1:])
+		p("")
+		writeResultTable(p, rs)
+		p("")
+		p("### Observations")
+		p("")
+		writeObservations(p, rs)
 	}
 
 	p("")
@@ -314,55 +427,15 @@ func exportMarkdown(outPath, dataFile string, fileSize int64, passes int, result
 	p("")
 	p("1. **Dataset**: a `%.0f MB` file filled with pseudo-random bytes (PCG-64 RNG,", float64(fileSize)/(1024*1024))
 	p("   deterministic seed) to defeat filesystem-level compression.")
-	p("2. **Cache bypass**: `%s` is applied before each pass to ensure reads", directIOMethod())
-	p("   come from disk, not the OS page cache.  Additionally, `%s` is", pageCacheDropMethod())
+	p("2. **Cache bypass**: `%s` is applied before each pass to ensure reads come", directIOMethod())
+	p("   from the storage device, not the OS page cache.  Additionally, `%s` is", pageCacheDropMethod())
 	p("   invoked prior to each pass (best-effort; a warning is printed if it fails).")
-	p("3. **Measurement**: wall-clock time is recorded around each `read(2)` call.")
-	p("   The file is read sequentially from start to finish.")
-	p("4. **Aggregation**: when multiple passes are requested, latency samples are")
+	p("3. **Sequential mode**: reads the file from start to finish with `read(2)`.")
+	p("4. **Random mode**: issues the same number of reads (`fileSize / pageSize`)")
+	p("   at uniformly random page-aligned offsets via `pread(2)` (`ReadAt`).")
+	p("   Offsets are pre-generated before the timed loop to exclude RNG overhead.")
+	p("5. **Aggregation**: when multiple passes are requested, latency samples are")
 	p("   pooled and throughput / IOPS are averaged across all passes.")
-	p("")
-	p("## Observations")
-	p("")
-
-	// Find best throughput entry and the trend description.
-	best := results[0]
-	for _, r := range results[1:] {
-		if r.throughputMBps() > best.throughputMBps() {
-			best = r
-		}
-	}
-	p("- Peak throughput **%.2f MB/s** achieved with **%s** page size.",
-		best.throughputMBps(), fmtSize(best.pageSize))
-
-	// Compare first vs last
-	first, last := results[0], results[len(results)-1]
-	ratio := last.throughputMBps() / first.throughputMBps()
-	trend := "higher"
-	if ratio < 1 {
-		ratio = 1 / ratio
-		trend = "lower"
-	}
-	p("- Throughput with %s pages is **%.1fx %s** than with %s pages,",
-		fmtSize(last.pageSize), ratio, trend, fmtSize(first.pageSize))
-	p("  reflecting reduced syscall overhead with larger buffers.")
-	p("- Larger page sizes increase per-read latency but amortise it over more bytes,")
-	p("  improving throughput until I/O device bandwidth is saturated.")
-
-	// Summarise key stats as a mini-table.
-	p("")
-	p("### Quick Reference")
-	p("")
-	p("| Page Size | Throughput | Avg Latency | P99 Latency |")
-	p("|----------:|-----------:|------------:|------------:|")
-	for _, r := range results {
-		p("| %s | %.2f MB/s | %s | %s |",
-			fmtSize(r.pageSize),
-			r.throughputMBps(),
-			fmtDuration(r.avg()),
-			fmtDuration(r.percentile(99)),
-		)
-	}
 	p("")
 	p("---")
 	p("")
@@ -376,16 +449,29 @@ func exportMarkdown(outPath, dataFile string, fileSize int64, passes int, result
 func main() {
 	var (
 		dir      = flag.String("dir", ".", "directory where the benchmark data file is stored")
-		sizeMB   = flag.Int("size", 512, "dataset size in MB (rounded down to nearest MB)")
+		sizeMB   = flag.Int("size", 512, "dataset size in MB")
 		output   = flag.String("output", "results.md", "path for the markdown results file")
 		skipInit = flag.Bool("skip-init", false, "skip dataset creation if a correct-size file already exists")
-		passes   = flag.Int("passes", 1, "number of read passes per page size (results are aggregated)")
+		passes   = flag.Int("passes", 1, "number of read passes per (page size, mode) pair")
+		modeFlag = flag.String("mode", "both", `access pattern: "seq", "rand", or "both"`)
 	)
 	flag.Parse()
 
+	// Parse mode flag.
+	var modes []readMode
+	switch *modeFlag {
+	case "seq", "sequential":
+		modes = []readMode{modeSeq}
+	case "rand", "random":
+		modes = []readMode{modeRand}
+	case "both", "all":
+		modes = []readMode{modeSeq, modeRand}
+	default:
+		log.Fatalf("unknown --mode %q: use seq, rand, or both", *modeFlag)
+	}
+
 	// Align file size to 1 MB so every page size divides it evenly.
 	fileSize := int64(*sizeMB) * 1024 * 1024
-
 	dataPath := filepath.Join(*dir, dataFileName)
 
 	if !*skipInit {
@@ -398,6 +484,10 @@ func main() {
 		}
 	}
 
+	modeNames := make([]string, len(modes))
+	for i, m := range modes {
+		modeNames[i] = m.String()
+	}
 	log.Printf("Starting benchmark")
 	log.Printf("  File   : %s (%.0f MB)", dataPath, float64(fileSize)/(1024*1024))
 	log.Printf("  Sizes  : %s", strings.Join(func() []string {
@@ -407,23 +497,28 @@ func main() {
 		}
 		return ss
 	}(), ", "))
+	log.Printf("  Mode   : %s", strings.Join(modeNames, ", "))
 	log.Printf("  Passes : %d", *passes)
 	log.Printf("  Method : %s + %s (cache drop)", directIOMethod(), pageCacheDropMethod())
 
-	results := make([]*result, 0, len(pageSizes))
-	for _, ps := range pageSizes {
-		log.Printf("Benchmarking %s pages...", fmtSize(ps))
-		r, err := benchmark(dataPath, ps, *passes)
-		if err != nil {
-			log.Fatalf("benchmark [%s]: %v", fmtSize(ps), err)
+	allResults := make(map[readMode][]*result)
+
+	for _, mode := range modes {
+		log.Printf("=== %s read ===", strings.ToUpper(mode.String()))
+		for _, ps := range pageSizes {
+			log.Printf("Benchmarking %s pages (%s)...", fmtSize(ps), mode)
+			r, err := benchmark(dataPath, ps, mode, *passes)
+			if err != nil {
+				log.Fatalf("benchmark [%s/%s]: %v", fmtSize(ps), mode, err)
+			}
+			allResults[mode] = append(allResults[mode], r)
+			log.Printf("  => %.2f MB/s, %.0f IOPS, avg %s, p99 %s",
+				r.throughputMBps(), r.iops(),
+				fmtDuration(r.avg()), fmtDuration(r.percentile(99)))
 		}
-		results = append(results, r)
-		log.Printf("  => %.2f MB/s, %.0f IOPS, avg %s, p99 %s",
-			r.throughputMBps(), r.iops(),
-			fmtDuration(r.avg()), fmtDuration(r.percentile(99)))
 	}
 
-	if err := exportMarkdown(*output, dataPath, fileSize, *passes, results); err != nil {
+	if err := exportMarkdown(*output, dataPath, fileSize, *passes, allResults); err != nil {
 		log.Fatalf("export markdown: %v", err)
 	}
 	log.Printf("Results written to: %s", *output)
