@@ -404,9 +404,6 @@ func exportMarkdown(outPath, dataFile string, fileSize int64, passes int, allRes
 	if storage != nil {
 		p("| Storage Device | %s (`%s`) |", storage.Model, storage.Device)
 		p("| Interface | %s |", storage.Interface())
-		if storage.Serial != "" {
-			p("| Serial | %s |", storage.Serial)
-		}
 		if storage.Firmware != "" {
 			p("| Firmware | %s |", storage.Firmware)
 		}
