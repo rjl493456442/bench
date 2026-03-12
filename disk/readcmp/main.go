@@ -166,7 +166,6 @@ func main() {
 			for _, qd := range qds {
 				for _, engineName := range engineList {
 					eng := engines[engineName]
-
 					cfg := RunConfig{
 						FilePath:        dataPath,
 						FileSize:        fileSize,
@@ -177,14 +176,12 @@ func main() {
 						SQPoll:          *sqpoll && engineName == "uring",
 						RegisteredFiles: *regFiles && engineName == "uring",
 					}
-
-					// Drop page cache before each run for fairness.
-					if err := dropPageCache(dataPath); err != nil {
-						log.Printf("  Warning: could not drop page cache: %v", err)
-					}
-
 					var combined *RunResult
 					for pass := 1; pass <= *passes; pass++ {
+						// Drop page cache before each run for fairness.
+						if err := dropPageCache(dataPath); err != nil {
+							log.Printf("  Warning: could not drop page cache: %v", err)
+						}
 						log.Printf("  [%s/%s/%s/QD%d] pass %d/%d...",
 							engineName, fmtSize(bs), mode.Short(), qd, pass, *passes)
 
